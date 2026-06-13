@@ -1,0 +1,132 @@
+// lpm/cli/args.lyx
+// WP-PM-02: CLI-Argument-Parser für lpm.
+// Parst argc/argv: globale Flags (--verbose, --offline, --registry=URL),
+// Subcommand und Subcommand-Argumente.
+
+@description("lpm CLI argument parser")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.cli.args;
+
+import src.std.io;
+
+// ---------------------------------------------------------------------------
+// Hilfsfunktionen
+// ---------------------------------------------------------------------------
+
+// Returns true if s starts with prefix.
+fn arHasPrefix(s: pchar, prefix: pchar): bool {
+  var plen: int64 := StrLen(prefix);
+  var slen: int64 := StrLen(s);
+  if slen < plen { return false; }
+  var i: int64 := 0;
+  while i < plen {
+    if peek8(s as int64 + i) as int64 != peek8(prefix as int64 + i) as int64 { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// LpmCtx — parsed CLI context
+// ---------------------------------------------------------------------------
+
+pub type LpmCtx = class {
+  lcArgc:    int64;
+  lcArgv:    pchar;
+  lcVerbose: bool;
+  lcOffline: bool;
+  lcRegistry: pchar;   // --registry=URL (points into argv, not owned)
+  lcSubIdx:  int64;    // argv index of subcommand (0 = none)
+
+  pub fn LcInit(argc: int64, argv: pchar): void {
+    self.lcArgc     := argc;
+    self.lcArgv     := argv;
+    self.lcVerbose  := false;
+    self.lcOffline  := false;
+    self.lcRegistry := 0 as pchar;
+    self.lcSubIdx   := 0;
+
+    var i: int64 := 1;
+    while i < argc {
+      var arg: pchar := ArgvGet(argv, i);
+      if StrCmp(arg, "--verbose"c) == 0 || StrCmp(arg, "-v"c) == 0 {
+        self.lcVerbose := true;
+      } else if StrCmp(arg, "--offline"c) == 0 {
+        self.lcOffline := true;
+      } else if arHasPrefix(arg, "--registry="c) {
+        self.lcRegistry := (arg as int64 + 11) as pchar;
+      } else if peek8(arg as int64) as int64 == 45 {
+        // unknown flag — skip
+      } else {
+        // first non-flag arg is the subcommand
+        if self.lcSubIdx == 0 { self.lcSubIdx := i; }
+      }
+      i := i + 1;
+    }
+  }
+
+  // Returns the subcommand string, or null if none given.
+  pub fn LcSubcmd(): pchar {
+    if self.lcSubIdx == 0 { return 0 as pchar; }
+    return ArgvGet(self.lcArgv, self.lcSubIdx);
+  }
+
+  // Returns the nth positional argument after the subcommand (0-based), or null.
+  pub fn LcSubArg(n: int64): pchar {
+    var pos: int64 := 0;
+    var i: int64 := self.lcSubIdx + 1;
+    while i < self.lcArgc {
+      var arg: pchar := ArgvGet(self.lcArgv, i);
+      if peek8(arg as int64) as int64 != 45 {
+        if pos == n { return arg; }
+        pos := pos + 1;
+      }
+      i := i + 1;
+    }
+    return 0 as pchar;
+  }
+
+  // Returns the number of positional arguments after the subcommand.
+  pub fn LcSubArgCount(): int64 {
+    var pos: int64 := 0;
+    var i: int64 := self.lcSubIdx + 1;
+    while i < self.lcArgc {
+      var arg: pchar := ArgvGet(self.lcArgv, i);
+      if peek8(arg as int64) as int64 != 45 { pos := pos + 1; }
+      i := i + 1;
+    }
+    return pos;
+  }
+
+  // Returns true if the given exact flag (e.g. "--help") appears anywhere in argv.
+  pub fn LcHasFlag(flag: pchar): bool {
+    var i: int64 := 1;
+    while i < self.lcArgc {
+      if StrCmp(ArgvGet(self.lcArgv, i), flag) == 0 { return true; }
+      i := i + 1;
+    }
+    return false;
+  }
+
+  // Returns the value of --name=value or next positional arg after --name.
+  // Returns null if flag not found.
+  pub fn LcFlagVal(name: pchar): pchar {
+    var nlen: int64 := StrLen(name);
+    var i: int64 := 1;
+    while i < self.lcArgc {
+      var arg: pchar := ArgvGet(self.lcArgv, i);
+      if arHasPrefix(arg, name) {
+        var alen: int64 := StrLen(arg);
+        if alen > nlen && peek8(arg as int64 + nlen) as int64 == 61 {
+          return (arg as int64 + nlen + 1) as pchar;
+        }
+        if StrCmp(arg, name) == 0 && i + 1 < self.lcArgc {
+          return ArgvGet(self.lcArgv, i + 1);
+        }
+      }
+      i := i + 1;
+    }
+    return 0 as pchar;
+  }
+}

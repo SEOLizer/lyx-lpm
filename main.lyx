@@ -1,0 +1,14 @@
+// main.lyx — lpm Einstiegspunkt
+// Lyx Package Manager v0.1.0
+
+@description("lpm — Lyx Package Manager entry point")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit main;
+
+import src.std.io;
+import lpm.cli.commands;
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  return lpmMain(argc, argv);
+}

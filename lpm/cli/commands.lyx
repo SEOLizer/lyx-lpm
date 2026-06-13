@@ -1,0 +1,241 @@
+// lpm/cli/commands.lyx
+// WP-PM-02: Subcommand-Dispatch und Implementierungen.
+// Voll implementiert: help, version, init, cache list.
+// Stubs (noch kein Netzwerk): install, remove, update, search, info,
+//                              list, publish, login, resolve.
+
+@description("lpm subcommand dispatch")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.cli.commands;
+
+import src.std.io;
+import src.std.fs;
+import lpm.cli.args;
+import lpm.core.manifest;
+import lpm.core.lockfile;
+
+// ---------------------------------------------------------------------------
+// Schreib-Hilfsfunktionen (via sys_write — kein io-Import nötig)
+// ---------------------------------------------------------------------------
+
+fn cmdWrS(buf: int64, pos: int64, s: pchar): int64 {
+  if s == 0 as pchar { return pos; }
+  var slen: int64 := StrLen(s);
+  memcpy(buf + pos, s as int64, slen);
+  return pos + slen;
+}
+
+fn cmdOut(s: pchar): void {
+  if s == 0 as pchar { return; }
+  sys_write(1, s as int64, StrLen(s));
+}
+fn cmdOutLn(s: pchar): void {
+  if s == 0 as pchar { sys_write(1, "\n"c as int64, 1); return; }
+  sys_write(1, s as int64, StrLen(s));
+  sys_write(1, "\n"c as int64, 1);
+}
+fn cmdErr(s: pchar): void {
+  sys_write(2, "lpm: error: "c as int64, 12);
+  sys_write(2, s as int64, StrLen(s));
+  sys_write(2, "\n"c as int64, 1);
+}
+
+// ---------------------------------------------------------------------------
+// HOME-Verzeichnis aus envp lesen (envp = argv + (argc+1)*8)
+// ---------------------------------------------------------------------------
+
+fn cmdGetHome(argc: int64, argv: pchar): pchar {
+  var envp: int64 := argv as int64 + (argc + 1) * 8;
+  var i: int64 := 0;
+  while true {
+    var env: pchar := peek64(envp + i * 8) as pchar;
+    if env == 0 as pchar { break; }
+    // Check if env starts with "HOME="
+    if StrLen(env) > 5 {
+      var found: bool := true;
+      var homeKey: pchar := "HOME="c;
+      var j: int64 := 0;
+      while j < 5 {
+        if peek8(env as int64 + j) as int64 != peek8(homeKey as int64 + j) as int64 {
+          found := false;
+          j := 5;
+        }
+        j := j + 1;
+      }
+      if found { return (env as int64 + 5) as pchar; }
+    }
+    i := i + 1;
+  }
+  return "/root"c;
+}
+
+// ---------------------------------------------------------------------------
+// lpm help
+// ---------------------------------------------------------------------------
+
+fn lpmHelp(): void {
+  cmdOutLn("lpm 0.1.0 — Lyx Package Manager"c);
+  cmdOutLn(""c);
+  cmdOutLn("Verwendung: lpm <subcommand> [optionen]"c);
+  cmdOutLn(""c);
+  cmdOutLn("Subcommands:"c);
+  cmdOutLn("  init [--name=<name>]   Neues Paket anlegen (erstellt lyx.toml)"c);
+  cmdOutLn("  install [<pkg>]        Paket installieren / alle Dependencies"c);
+  cmdOutLn("  remove <pkg>           Paket aus lyx.toml entfernen"c);
+  cmdOutLn("  update [<pkg>]         Paket(e) aktualisieren"c);
+  cmdOutLn("  search <query>         Registry durchsuchen"c);
+  cmdOutLn("  info <pkg>             Paketdetails anzeigen"c);
+  cmdOutLn("  list                   Installierte Pakete anzeigen"c);
+  cmdOutLn("  publish                Paket in Registry hochladen"c);
+  cmdOutLn("  login                  Registry-Authentifizierung"c);
+  cmdOutLn("  resolve <pkg>          Import-Auflösung für lyxc (intern)"c);
+  cmdOutLn("  cache list             Gecachte Pakete anzeigen"c);
+  cmdOutLn("  cache clean            Cache leeren"c);
+  cmdOutLn(""c);
+  cmdOutLn("Globale Optionen:"c);
+  cmdOutLn("  --verbose / -v         Ausführliche Ausgabe"c);
+  cmdOutLn("  --offline              Kein Netzwerkzugriff (nur Cache)"c);
+  cmdOutLn("  --registry=<url>       Alternative Registry-URL"c);
+  cmdOutLn("  --version / -V         Version ausgeben"c);
+  cmdOutLn("  --help / -h            Diese Hilfe"c);
+}
+
+// ---------------------------------------------------------------------------
+// lpm version
+// ---------------------------------------------------------------------------
+
+fn lpmVersion(): void {
+  cmdOutLn("lpm 0.1.0"c);
+}
+
+// ---------------------------------------------------------------------------
+// lpm init — schreibt lyx.toml direkt (ohne Manifest-Klasse, kein Alloc-Problem)
+// ---------------------------------------------------------------------------
+
+fn lpmInit(ctx: LpmCtx): int64 {
+  if FileExists("lyx.toml"c) {
+    cmdErr("lyx.toml existiert bereits in diesem Verzeichnis."c);
+    return 1;
+  }
+
+  var pkgName: pchar := ctx.LcFlagVal("--name"c);
+  if pkgName == 0 as pchar { pkgName := ctx.LcSubArg(0); }
+  if pkgName == 0 as pchar { pkgName := "mypackage"c; }
+
+  var tbuf: int64 := alloc(2048);
+  var pos: int64 := 0;
+  pos := cmdWrS(tbuf, pos, "[package]\n"c);
+  pos := cmdWrS(tbuf, pos, "name        = \""c);
+  pos := cmdWrS(tbuf, pos, pkgName);
+  pos := cmdWrS(tbuf, pos, "\"\n"c);
+  pos := cmdWrS(tbuf, pos, "version     = \"0.1.0\"\n"c);
+  pos := cmdWrS(tbuf, pos, "author      = \"\"\n"c);
+  pos := cmdWrS(tbuf, pos, "license     = \"MIT\"\n"c);
+  pos := cmdWrS(tbuf, pos, "description = \"\"\n"c);
+  pos := cmdWrS(tbuf, pos, "\n[build]\n"c);
+  pos := cmdWrS(tbuf, pos, "entry       = \"main.lyx\"\n"c);
+
+  var wfd: int64 := open("lyx.toml"c, 577, 420);  // O_WRONLY|O_CREAT|O_TRUNC, 0644
+  if wfd < 0 {
+    cmdErr("Konnte lyx.toml nicht schreiben."c);
+    free(tbuf, 2048);
+    return 1;
+  }
+  sys_write(wfd, tbuf, pos);
+  close(wfd);
+  free(tbuf, 2048);
+
+  cmdOut("lpm: Paket '"c);
+  cmdOut(pkgName);
+  cmdOutLn("' initialisiert."c);
+  cmdOutLn("lpm: lyx.toml wurde erstellt."c);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// lpm cache list
+// ---------------------------------------------------------------------------
+
+fn lpmCacheList(argc: int64, argv: pchar): int64 {
+  // PM-03: DirEntryName/DirFree benötigen std.fs (inkompatibel mit src.std.*)
+  cmdOutLn("lpm cache list: noch nicht implementiert (PM-03)."c);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Stubs für netzwerkabhängige Befehle
+// ---------------------------------------------------------------------------
+
+fn lpmNotImpl(cmd: pchar): int64 {
+  cmdOut("lpm: '"c);
+  cmdOut(cmd);
+  cmdOutLn("' ist noch nicht implementiert (Netzwerk-WPs folgen)."c);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var cmd: pchar := ctx.LcSubcmd();
+  if cmd == 0 as pchar {
+    lpmHelp();
+    return 1;
+  }
+
+  if StrCmp(cmd, "init"c)    == 0 { return lpmInit(ctx); }
+  if StrCmp(cmd, "install"c) == 0 { return lpmNotImpl("install"c); }
+  if StrCmp(cmd, "remove"c)  == 0 { return lpmNotImpl("remove"c); }
+  if StrCmp(cmd, "update"c)  == 0 { return lpmNotImpl("update"c); }
+  if StrCmp(cmd, "search"c)  == 0 { return lpmNotImpl("search"c); }
+  if StrCmp(cmd, "info"c)    == 0 { return lpmNotImpl("info"c); }
+  if StrCmp(cmd, "list"c)    == 0 { return lpmNotImpl("list"c); }
+  if StrCmp(cmd, "publish"c) == 0 { return lpmNotImpl("publish"c); }
+  if StrCmp(cmd, "login"c)   == 0 { return lpmNotImpl("login"c); }
+  if StrCmp(cmd, "resolve"c) == 0 { return lpmNotImpl("resolve"c); }
+
+  if StrCmp(cmd, "cache"c) == 0 {
+    var sub: pchar := ctx.LcSubArg(0);
+    if sub != 0 as pchar && StrCmp(sub, "list"c)  == 0 { return lpmCacheList(argc, argv); }
+    if sub != 0 as pchar && StrCmp(sub, "clean"c) == 0 { return lpmNotImpl("cache clean"c); }
+    cmdOutLn("lpm cache: Subcommand erwartet: list | clean"c);
+    return 1;
+  }
+
+  cmdOut("lpm: unbekannter Befehl '"c);
+  cmdOut(cmd);
+  cmdOutLn("'. Siehe: lpm --help"c);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Einstiegspunkt — wird von main.lyx aufgerufen
+// ---------------------------------------------------------------------------
+
+pub fn lpmMain(argc: int64, argv: pchar): int64 {
+  if argc < 2 {
+    lpmHelp();
+    return 1;
+  }
+
+  // Globale Flags zuerst prüfen (vor LpmCtx — einfache lineare Suche)
+  var i: int64 := 1;
+  while i < argc {
+    var arg: pchar := ArgvGet(argv, i);
+    if StrCmp(arg, "--help"c) == 0 || StrCmp(arg, "-h"c) == 0 {
+      lpmHelp(); return 0;
+    }
+    if StrCmp(arg, "--version"c) == 0 || StrCmp(arg, "-V"c) == 0 {
+      lpmVersion(); return 0;
+    }
+    i := i + 1;
+  }
+
+  var ctx: LpmCtx := new LpmCtx();
+  ctx.LcInit(argc, argv);
+  var result: int64 := lpmDispatch(ctx, argc, argv);
+  dispose ctx;
+  return result;
+}

@@ -1,0 +1,186 @@
+// lpm/core/semver.lyx
+// WP-PM-01: SemVer Parser, Comparator und Range-Matching.
+// Unterstützt: "X.Y.Z", "=X.Y.Z", ">=X.Y.Z", ">X.Y.Z",
+//              "<=X.Y.Z", "<X.Y.Z", "^X.Y.Z", "~X.Y.Z", "*", "latest".
+
+@description("Semantic Versioning parser and range matcher")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.semver;
+
+import src.std.io;
+
+// ---------------------------------------------------------------------------
+// SemVer
+// ---------------------------------------------------------------------------
+
+pub type SemVer = class {
+  svMajor: int64;
+  svMinor: int64;
+  svPatch: int64;
+  svValid: bool;
+
+  // Parse "X.Y.Z" (leading "=" ignored) into self.
+  pub fn SvParse(s: pchar): void {
+    self.svMajor := 0;
+    self.svMinor := 0;
+    self.svPatch := 0;
+    self.svValid := false;
+    if s == 0 as pchar { return; }
+    var i: int64 := 0;
+    // skip optional leading '='
+    if peek8(s as int64 + i) as int64 == 61 { i := i + 1; }
+    // major
+    var c: int64 := peek8(s as int64 + i) as int64;
+    if c < 48 || c > 57 { return; }
+    while true {
+      c := peek8(s as int64 + i) as int64;
+      if c < 48 || c > 57 { break; }
+      self.svMajor := self.svMajor * 10 + (c - 48);
+      i := i + 1;
+    }
+    if peek8(s as int64 + i) as int64 != 46 { return; }
+    i := i + 1;
+    // minor
+    c := peek8(s as int64 + i) as int64;
+    if c < 48 || c > 57 { return; }
+    while true {
+      c := peek8(s as int64 + i) as int64;
+      if c < 48 || c > 57 { break; }
+      self.svMinor := self.svMinor * 10 + (c - 48);
+      i := i + 1;
+    }
+    if peek8(s as int64 + i) as int64 != 46 { return; }
+    i := i + 1;
+    // patch
+    c := peek8(s as int64 + i) as int64;
+    if c < 48 || c > 57 { return; }
+    while true {
+      c := peek8(s as int64 + i) as int64;
+      if c < 48 || c > 57 { break; }
+      self.svPatch := self.svPatch * 10 + (c - 48);
+      i := i + 1;
+    }
+    self.svValid := true;
+  }
+
+  // Returns -1 (self < b), 0 (equal), 1 (self > b).
+  pub fn SvCmp(b: SemVer): int64 {
+    if self.svMajor < b.svMajor { return 0 - 1; }
+    if self.svMajor > b.svMajor { return 1; }
+    if self.svMinor < b.svMinor { return 0 - 1; }
+    if self.svMinor > b.svMinor { return 1; }
+    if self.svPatch < b.svPatch { return 0 - 1; }
+    if self.svPatch > b.svPatch { return 1; }
+    return 0;
+  }
+
+  // Returns true if self satisfies the given constraint.
+  pub fn SvSatisfies(constraint: pchar): bool {
+    if constraint == 0 as pchar { return true; }
+    var c0: int64 := peek8(constraint as int64) as int64;
+    // "*" — any version
+    if c0 == 42 { return true; }
+    // "latest" — any version
+    if c0 == 108 {
+      if StrCmp(constraint, "latest"c) == 0 { return true; }
+    }
+    // "^X.Y.Z" — compatible: >=X.Y.Z, <(X+1).0.0
+    if c0 == 94 {
+      return self.svSatisfiesCaret(constraint);
+    }
+    // "~X.Y.Z" — patch-compatible: >=X.Y.Z, <X.(Y+1).0
+    if c0 == 126 {
+      return self.svSatisfiesTilde(constraint);
+    }
+    // ">=X.Y.Z"
+    if c0 == 62 {
+      return self.svSatisfiesGt(constraint);
+    }
+    // "<=X.Y.Z" or "<X.Y.Z"
+    if c0 == 60 {
+      return self.svSatisfiesLt(constraint);
+    }
+    // "=X.Y.Z" or bare "X.Y.Z" — exact match
+    return self.svSatisfiesExact(constraint);
+  }
+
+  fn svSatisfiesCaret(constraint: pchar): bool {
+    var lo: SemVer := new SemVer();
+    lo.SvParse((constraint as int64 + 1) as pchar);
+    if !lo.svValid { dispose lo; return false; }
+    var hi: SemVer := new SemVer();
+    hi.svMajor := lo.svMajor + 1;
+    hi.svMinor := 0;
+    hi.svPatch := 0;
+    hi.svValid := true;
+    var loOk: bool := self.SvCmp(lo) >= 0;
+    var hiOk: bool := self.SvCmp(hi) < 0;
+    dispose lo;
+    dispose hi;
+    return loOk && hiOk;
+  }
+
+  fn svSatisfiesTilde(constraint: pchar): bool {
+    var lo: SemVer := new SemVer();
+    lo.SvParse((constraint as int64 + 1) as pchar);
+    if !lo.svValid { dispose lo; return false; }
+    var hi: SemVer := new SemVer();
+    hi.svMajor := lo.svMajor;
+    hi.svMinor := lo.svMinor + 1;
+    hi.svPatch := 0;
+    hi.svValid := true;
+    var loOk: bool := self.SvCmp(lo) >= 0;
+    var hiOk: bool := self.SvCmp(hi) < 0;
+    dispose lo;
+    dispose hi;
+    return loOk && hiOk;
+  }
+
+  fn svSatisfiesGt(constraint: pchar): bool {
+    var c1: int64 := peek8(constraint as int64 + 1) as int64;
+    var other: SemVer := new SemVer();
+    if c1 == 61 {
+      // ">="
+      other.SvParse((constraint as int64 + 2) as pchar);
+      if !other.svValid { dispose other; return false; }
+      var ok: bool := self.SvCmp(other) >= 0;
+      dispose other;
+      return ok;
+    }
+    // ">"
+    other.SvParse((constraint as int64 + 1) as pchar);
+    if !other.svValid { dispose other; return false; }
+    var ok: bool := self.SvCmp(other) > 0;
+    dispose other;
+    return ok;
+  }
+
+  fn svSatisfiesLt(constraint: pchar): bool {
+    var c1: int64 := peek8(constraint as int64 + 1) as int64;
+    var other: SemVer := new SemVer();
+    if c1 == 61 {
+      // "<="
+      other.SvParse((constraint as int64 + 2) as pchar);
+      if !other.svValid { dispose other; return false; }
+      var ok: bool := self.SvCmp(other) <= 0;
+      dispose other;
+      return ok;
+    }
+    // "<"
+    other.SvParse((constraint as int64 + 1) as pchar);
+    if !other.svValid { dispose other; return false; }
+    var ok: bool := self.SvCmp(other) < 0;
+    dispose other;
+    return ok;
+  }
+
+  fn svSatisfiesExact(constraint: pchar): bool {
+    var other: SemVer := new SemVer();
+    other.SvParse(constraint);
+    if !other.svValid { dispose other; return false; }
+    var ok: bool := self.SvCmp(other) == 0;
+    dispose other;
+    return ok;
+  }
+}
