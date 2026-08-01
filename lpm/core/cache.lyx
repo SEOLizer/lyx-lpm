@@ -1,0 +1,299 @@
+// lpm/core/cache.lyx
+// WP-PM-03: Lokaler Paket-Cache unter ~/.lpm/.
+//
+// Layout:
+//   ~/.lpm/cache/<name>/<version>/        z.B. ~/.lpm/cache/buffer/2.1.3/
+//   ~/.lpm/cache/<ns>/<name>/<version>/   z.B. ~/.lpm/cache/net/http/1.2.0/
+//   ~/.lpm/registry/                      Index-Cache (WP-PM-05)
+//   ~/.lpm/keys/                          Publisher-Keys (WP-PM-10)
+//
+// Ein Verzeichnis gilt als Versions-Ebene, wenn sein Name mit einer Ziffer
+// beginnt. So werden flache und hierarchische Namespaces ohne Zusatzmetadaten
+// unterschieden.
+//
+// Das Entpacken von .lxpkg-Archiven (tar.zst) folgt separat.
+
+@description("lpm local package cache")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.cache;
+
+import src.std.io;
+import src.std.fs;
+import lpm.core.dirent;
+
+con LPC_PATH_MAX: int64 := 4096;
+con LPC_DIR_MODE: int64 := 493;   // 0755
+
+// ---------------------------------------------------------------------------
+// Pfad-Helfer
+// ---------------------------------------------------------------------------
+
+// Haengt s an buf[pos] an und liefert die neue Position.
+fn lpcAppend(buf: int64, pos: int64, s: pchar): int64 {
+  if s == 0 as pchar { return pos; }
+  var slen: int64 := StrLen(s);
+  memcpy(buf + pos, s as int64, slen);
+  return pos + slen;
+}
+
+// Terminiert den Puffer an Position pos.
+fn lpcEnd(buf: int64, pos: int64): void {
+  poke8(buf + pos, 0);
+}
+
+// Baut "<home>/.lpm<suffix>" in einen frisch allozierten Puffer.
+// Der Aufrufer muss LpmCacheFreePath aufrufen.
+fn lpcRootPath(home: pchar, suffix: pchar): pchar {
+  var buf: int64 := alloc(LPC_PATH_MAX);
+  var pos: int64 := 0;
+  pos := lpcAppend(buf, pos, home);
+  pos := lpcAppend(buf, pos, "/.lpm"c);
+  pos := lpcAppend(buf, pos, suffix);
+  lpcEnd(buf, pos);
+  return buf as pchar;
+}
+
+// Gibt einen von diesem Modul gelieferten Pfad frei.
+pub fn LpmCacheFreePath(p: pchar): void {
+  if p != 0 as pchar { free(p as int64, LPC_PATH_MAX); }
+}
+
+// ~/.lpm
+pub fn LpmCacheRoot(home: pchar): pchar {
+  return lpcRootPath(home, ""c);
+}
+
+// ~/.lpm/cache
+pub fn LpmCacheDir(home: pchar): pchar {
+  return lpcRootPath(home, "/cache"c);
+}
+
+// ~/.lpm/registry
+pub fn LpmCacheRegistryDir(home: pchar): pchar {
+  return lpcRootPath(home, "/registry"c);
+}
+
+// ~/.lpm/cache/<name>/<version>
+// name darf Slashes enthalten ("net/http") — die Struktur bildet sich direkt ab.
+pub fn LpmCachePkgPath(home: pchar, name: pchar, version: pchar): pchar {
+  var buf: int64 := alloc(LPC_PATH_MAX);
+  var pos: int64 := 0;
+  pos := lpcAppend(buf, pos, home);
+  pos := lpcAppend(buf, pos, "/.lpm/cache/"c);
+  pos := lpcAppend(buf, pos, name);
+  if version != 0 as pchar {
+    pos := lpcAppend(buf, pos, "/"c);
+    pos := lpcAppend(buf, pos, version);
+  }
+  lpcEnd(buf, pos);
+  return buf as pchar;
+}
+
+// ---------------------------------------------------------------------------
+// Initialisierung
+// ---------------------------------------------------------------------------
+
+// Legt ~/.lpm samt Unterverzeichnissen an, falls nicht vorhanden.
+// Rueckgabe: true wenn danach alle Verzeichnisse existieren.
+pub fn LpmCacheEnsure(home: pchar): bool {
+  var root: pchar := LpmCacheRoot(home);
+  if !IsDirectory(root) { Mkdir(root, LPC_DIR_MODE); }
+  var ok: bool := IsDirectory(root);
+  LpmCacheFreePath(root);
+  if !ok { return false; }
+
+  var sub: pchar := lpcRootPath(home, "/cache"c);
+  if !IsDirectory(sub) { Mkdir(sub, LPC_DIR_MODE); }
+  ok := IsDirectory(sub);
+  LpmCacheFreePath(sub);
+  if !ok { return false; }
+
+  sub := lpcRootPath(home, "/registry"c);
+  if !IsDirectory(sub) { Mkdir(sub, LPC_DIR_MODE); }
+  ok := IsDirectory(sub);
+  LpmCacheFreePath(sub);
+  return ok;
+}
+
+// Ist <name>@<version> bereits im Cache?
+pub fn LpmCacheHas(home: pchar, name: pchar, version: pchar): bool {
+  var p: pchar := LpmCachePkgPath(home, name, version);
+  var found: bool := IsDirectory(p);
+  LpmCacheFreePath(p);
+  return found;
+}
+
+// ---------------------------------------------------------------------------
+// Auflisten
+// ---------------------------------------------------------------------------
+
+// Beginnt der Name mit einer Ziffer? Dann ist es eine Versions-Ebene.
+fn lpcIsVersionDir(name: pchar): bool {
+  if name == 0 as pchar { return false; }
+  var c: int64 := peek8(name as int64) as int64;
+  return c >= 48 && c <= 57;
+}
+
+// Gibt "<prefix>@<version>" aus.
+fn lpcPrintEntry(prefix: pchar, prefixLen: int64, version: pchar): void {
+  sys_write(1, "  "c as int64, 2);
+  sys_write(1, prefix as int64, prefixLen);
+  sys_write(1, "@"c as int64, 1);
+  sys_write(1, version as int64, StrLen(version));
+  sys_write(1, "\n"c as int64, 1);
+}
+
+// Laeuft rekursiv durch den Cache-Baum und gibt jedes gefundene
+// Paket@Version aus. relName ist der bisher aufgebaute Paketname.
+// Rueckgabe: Anzahl gefundener Paket-Versionen.
+fn lpcWalk(dirPath: pchar, relName: int64, relLen: int64, depth: int64): int64 {
+  if depth > 3 { return 0; }
+
+  var dl: int64 := LpmDirOpen(dirPath);
+  if dl == 0 { return 0; }
+
+  var total: int64 := 0;
+  var n: int64 := LpmDirCount(dl);
+  var i: int64 := 0;
+  while i < n {
+    if LpmDirType(dl, i) == LPD_DT_DIR {
+      var ename: pchar := LpmDirName(dl, i);
+      var elen:  int64 := LpmDirNameLen(dl, i);
+
+      if lpcIsVersionDir(ename) {
+        if relLen > 0 {
+          lpcPrintEntry(relName as pchar, relLen, ename);
+          total := total + 1;
+        }
+      } else {
+        // Namens-Ebene: relName um "/<ename>" erweitern und absteigen
+        var subName: int64 := alloc(LPC_PATH_MAX);
+        var np: int64 := 0;
+        if relLen > 0 {
+          memcpy(subName, relName, relLen);
+          np := relLen;
+          poke8(subName + np, 47);  // '/'
+          np := np + 1;
+        }
+        memcpy(subName + np, ename as int64, elen);
+        np := np + elen;
+        poke8(subName + np, 0);
+
+        var subPath: int64 := alloc(LPC_PATH_MAX);
+        var sp: int64 := 0;
+        sp := lpcAppend(subPath, sp, dirPath);
+        poke8(subPath + sp, 47);
+        sp := sp + 1;
+        memcpy(subPath + sp, ename as int64, elen);
+        sp := sp + elen;
+        poke8(subPath + sp, 0);
+
+        total := total + lpcWalk(subPath as pchar, subName, np, depth + 1);
+
+        free(subPath, LPC_PATH_MAX);
+        free(subName, LPC_PATH_MAX);
+      }
+    }
+    i := i + 1;
+  }
+
+  LpmDirClose(dl);
+  return total;
+}
+
+// Gibt alle gecachten Pakete aus. Rueckgabe: Exit-Code (0 = OK).
+pub fn LpmCacheListCmd(home: pchar): int64 {
+  var cacheDir: pchar := LpmCacheDir(home);
+
+  if !IsDirectory(cacheDir) {
+    sys_write(1, "lpm: Cache ist leer (kein "c as int64, 26);
+    sys_write(1, cacheDir as int64, StrLen(cacheDir));
+    sys_write(1, ").\n"c as int64, 3);
+    LpmCacheFreePath(cacheDir);
+    return 0;
+  }
+
+  sys_write(1, "Gecachte Pakete in "c as int64, 19);
+  sys_write(1, cacheDir as int64, StrLen(cacheDir));
+  sys_write(1, ":\n"c as int64, 2);
+
+  var count: int64 := lpcWalk(cacheDir, 0, 0, 0);
+
+  if count == 0 {
+    sys_write(1, "  (keine)\n"c as int64, 10);
+  } else {
+    sys_write(1, "\n"c as int64, 1);
+    PrintInt(count);
+    sys_write(1, " Paket-Version(en).\n"c as int64, 20);
+  }
+
+  LpmCacheFreePath(cacheDir);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Leeren
+// ---------------------------------------------------------------------------
+
+// Loescht einen Verzeichnisbaum rekursiv. Nur fuer Pfade unterhalb von
+// ~/.lpm/cache/ gedacht — der Aufrufer verantwortet die Eingrenzung.
+// Rueckgabe: Anzahl geloeschter Eintraege (Dateien + Verzeichnisse).
+fn lpcRemoveTree(dirPath: pchar, depth: int64): int64 {
+  if depth > 8 { return 0; }
+
+  var dl: int64 := LpmDirOpen(dirPath);
+  if dl == 0 { return 0; }
+
+  var removed: int64 := 0;
+  var n: int64 := LpmDirCount(dl);
+  var i: int64 := 0;
+  while i < n {
+    var ename: pchar := LpmDirName(dl, i);
+    var elen:  int64 := LpmDirNameLen(dl, i);
+    var etype: int64 := LpmDirType(dl, i);
+
+    var childPath: int64 := alloc(LPC_PATH_MAX);
+    var cp: int64 := 0;
+    cp := lpcAppend(childPath, cp, dirPath);
+    poke8(childPath + cp, 47);
+    cp := cp + 1;
+    memcpy(childPath + cp, ename as int64, elen);
+    cp := cp + elen;
+    poke8(childPath + cp, 0);
+
+    if etype == LPD_DT_DIR {
+      removed := removed + lpcRemoveTree(childPath as pchar, depth + 1);
+      if Rmdir(childPath as pchar) { removed := removed + 1; }
+    } else {
+      if Remove(childPath as pchar) { removed := removed + 1; }
+    }
+
+    free(childPath, LPC_PATH_MAX);
+    i := i + 1;
+  }
+
+  LpmDirClose(dl);
+  return removed;
+}
+
+// Leert ~/.lpm/cache/ vollstaendig, laesst das Verzeichnis selbst bestehen.
+// Rueckgabe: Exit-Code (0 = OK).
+pub fn LpmCacheCleanCmd(home: pchar): int64 {
+  var cacheDir: pchar := LpmCacheDir(home);
+
+  if !IsDirectory(cacheDir) {
+    sys_write(1, "lpm: Cache ist bereits leer.\n"c as int64, 29);
+    LpmCacheFreePath(cacheDir);
+    return 0;
+  }
+
+  var removed: int64 := lpcRemoveTree(cacheDir, 0);
+
+  sys_write(1, "lpm: Cache geleert ("c as int64, 20);
+  PrintInt(removed);
+  sys_write(1, " Eintraege entfernt).\n"c as int64, 22);
+
+  LpmCacheFreePath(cacheDir);
+  return 0;
+}

@@ -1,0 +1,9 @@
+[package]
+name        = "lpm"
+version     = "0.1.0"
+author      = "Andreas Röne <andreas.roene@seolizer.de>"
+license     = "MIT"
+description = "Lyx Package Manager"
+
+[build]
+entry = "main.lyx"

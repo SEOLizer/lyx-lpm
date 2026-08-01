@@ -1,0 +1,372 @@
+// lpm/core/manifest.lyx
+// WP-PM-01: lyx.toml Parser und Manifest-Struct.
+// Unterstützter TOML-Subset: Sektionen [package], [dependencies],
+// [dev-dependencies], [build]; gequotete und ungequotete Keys; String-Values.
+
+@description("lyx.toml Manifest parser and writer")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.manifest;
+
+import src.std.io;
+import src.std.fs;
+
+// ---------------------------------------------------------------------------
+// Konstanten
+// ---------------------------------------------------------------------------
+
+con MF_SEC_NONE:    int64 := 0;
+con MF_SEC_PKG:     int64 := 1;
+con MF_SEC_DEPS:    int64 := 2;
+con MF_SEC_DEVDEPS: int64 := 3;
+con MF_SEC_BUILD:   int64 := 4;
+
+pub con MF_MAX_DEPS: int64 := 64;
+con MF_BUF_SZ:       int64 := 8192;
+con MF_STR_MAX:      int64 := 512;
+
+// ---------------------------------------------------------------------------
+// Modul-Level TOML-Hilfsfunktionen
+// ---------------------------------------------------------------------------
+
+// Skip spaces and tabs; return new offset.
+fn mfWs(buf: int64, off: int64): int64 {
+  var i: int64 := off;
+  while true {
+    var c: int64 := peek8(buf + i) as int64;
+    if c != 32 && c != 9 { break; }
+    i := i + 1;
+  }
+  return i;
+}
+
+// Advance past current line; return start of next line.
+fn mfNL(buf: int64, off: int64): int64 {
+  var i: int64 := off;
+  while true {
+    var c: int64 := peek8(buf + i) as int64;
+    if c == 0 { break; }
+    if c == 10 { i := i + 1; break; }
+    i := i + 1;
+  }
+  return i;
+}
+
+// Read quoted string "..." at buf[off] (buf[off] must be '"').
+// Writes to dst (cap bytes max, NUL-terminated). Returns source chars consumed.
+fn mfQuoted(buf: int64, off: int64, dst: int64, cap: int64): int64 {
+  var i: int64 := off + 1;  // skip opening '"'
+  var dlen: int64 := 0;
+  while dlen < cap - 1 {
+    var c: int64 := peek8(buf + i) as int64;
+    if c == 0 || c == 10 || c == 34 { break; }
+    if c == 92 {
+      i := i + 1;
+      var e: int64 := peek8(buf + i) as int64;
+      if e == 110 { c := 10; }
+      else if e == 116 { c := 9; }
+      else { c := e; }
+    }
+    poke8(dst + dlen, c);
+    dlen := dlen + 1;
+    i := i + 1;
+  }
+  poke8(dst + dlen, 0);
+  // advance past closing '"'
+  if peek8(buf + i) as int64 == 34 { i := i + 1; }
+  return i - off;  // total source chars consumed
+}
+
+// Read an unquoted token at buf[off] (stops at WS, '=', '#', LF, NUL).
+// Writes to dst. Returns source chars consumed.
+fn mfToken(buf: int64, off: int64, dst: int64, cap: int64): int64 {
+  var i: int64 := off;
+  var dlen: int64 := 0;
+  while dlen < cap - 1 {
+    var c: int64 := peek8(buf + i) as int64;
+    if c == 0 || c == 10 || c == 13 || c == 32 || c == 9 || c == 35 || c == 61 { break; }
+    poke8(dst + dlen, c);
+    dlen := dlen + 1;
+    i := i + 1;
+  }
+  // rtrim
+  while dlen > 0 {
+    var last: int64 := peek8(dst + dlen - 1) as int64;
+    if last != 32 && last != 9 && last != 13 { break; }
+    dlen := dlen - 1;
+  }
+  poke8(dst + dlen, 0);
+  return i - off;
+}
+
+// Duplicate src[0..slen) into a new alloc'd buffer (NUL-terminated).
+fn mfDup(src: int64, slen: int64): pchar {
+  if slen <= 0 { return 0 as pchar; }
+  var dst: int64 := alloc(slen + 1);
+  memcpy(dst, src, slen);
+  poke8(dst + slen, 0);
+  return dst as pchar;
+}
+
+// Append string s to buf at pos; return new pos.
+fn mfWrS(buf: int64, pos: int64, s: pchar): int64 {
+  if s == 0 as pchar { return pos; }
+  var slen: int64 := StrLen(s);
+  memcpy(buf + pos, s as int64, slen);
+  return pos + slen;
+}
+
+// Append key = "value"\n to buf; return new pos.
+fn mfWrKV(buf: int64, pos: int64, key: pchar, vlu: pchar): int64 {
+  pos := mfWrS(buf, pos, key);
+  pos := mfWrS(buf, pos, " = \""c);
+  pos := mfWrS(buf, pos, vlu);
+  pos := mfWrS(buf, pos, "\"\n"c);
+  return pos;
+}
+
+// Map section name string → MF_SEC_* constant.
+fn mfSecOf(sbuf: int64): int64 {
+  var sp: pchar := sbuf as pchar;
+  if StrCmp(sp, "package"c)          == 0 { return MF_SEC_PKG; }
+  if StrCmp(sp, "dependencies"c)     == 0 { return MF_SEC_DEPS; }
+  if StrCmp(sp, "dev-dependencies"c) == 0 { return MF_SEC_DEVDEPS; }
+  if StrCmp(sp, "build"c)            == 0 { return MF_SEC_BUILD; }
+  return MF_SEC_NONE;
+}
+
+// ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
+
+pub type Manifest = class {
+  mName:     pchar;
+  mVersion:  pchar;
+  mAuthor:   pchar;
+  mLicense:  pchar;
+  mDesc:     pchar;
+  mEntry:    pchar;
+
+  mDepNames: int64;   // pchar[MF_MAX_DEPS]
+  mDepVers:  int64;   // pchar[MF_MAX_DEPS]
+  mDepCount: int64;
+
+  mDevNames: int64;
+  mDevVers:  int64;
+  mDevCount: int64;
+
+  pub fn MfInit(): void {
+    self.mName    := 0 as pchar;
+    self.mVersion := 0 as pchar;
+    self.mAuthor  := 0 as pchar;
+    self.mLicense := 0 as pchar;
+    self.mDesc    := 0 as pchar;
+    self.mEntry   := 0 as pchar;
+    self.mDepNames := alloc(MF_MAX_DEPS * 8);
+    self.mDepVers  := alloc(MF_MAX_DEPS * 8);
+    self.mDepCount := 0;
+    self.mDevNames := alloc(MF_MAX_DEPS * 8);
+    self.mDevVers  := alloc(MF_MAX_DEPS * 8);
+    self.mDevCount := 0;
+  }
+
+  fn mfFreeS(s: pchar): void {
+    if s != 0 as pchar { free(s as int64, StrLen(s) + 1); }
+  }
+
+  pub fn MfFree(): void {
+    self.mfFreeS(self.mName);
+    self.mfFreeS(self.mVersion);
+    self.mfFreeS(self.mAuthor);
+    self.mfFreeS(self.mLicense);
+    self.mfFreeS(self.mDesc);
+    self.mfFreeS(self.mEntry);
+    var i: int64 := 0;
+    while i < self.mDepCount {
+      self.mfFreeS(peek64(self.mDepNames + i * 8) as pchar);
+      self.mfFreeS(peek64(self.mDepVers  + i * 8) as pchar);
+      i := i + 1;
+    }
+    free(self.mDepNames, MF_MAX_DEPS * 8);
+    free(self.mDepVers,  MF_MAX_DEPS * 8);
+    i := 0;
+    while i < self.mDevCount {
+      self.mfFreeS(peek64(self.mDevNames + i * 8) as pchar);
+      self.mfFreeS(peek64(self.mDevVers  + i * 8) as pchar);
+      i := i + 1;
+    }
+    free(self.mDevNames, MF_MAX_DEPS * 8);
+    free(self.mDevVers,  MF_MAX_DEPS * 8);
+  }
+
+  pub fn MfAddDep(name: pchar, ver: pchar): void {
+    if self.mDepCount >= MF_MAX_DEPS { return; }
+    poke64(self.mDepNames + self.mDepCount * 8, mfDup(name as int64, StrLen(name)) as int64);
+    poke64(self.mDepVers  + self.mDepCount * 8, mfDup(ver  as int64, StrLen(ver))  as int64);
+    self.mDepCount := self.mDepCount + 1;
+  }
+
+  pub fn MfAddDevDep(name: pchar, ver: pchar): void {
+    if self.mDevCount >= MF_MAX_DEPS { return; }
+    poke64(self.mDevNames + self.mDevCount * 8, mfDup(name as int64, StrLen(name)) as int64);
+    poke64(self.mDevVers  + self.mDevCount * 8, mfDup(ver  as int64, StrLen(ver))  as int64);
+    self.mDevCount := self.mDevCount + 1;
+  }
+
+  // Apply a parsed [package] key=value.
+  fn mfApplyPkg(kbuf: int64, vbuf: int64, vlen: int64): void {
+    var kp: pchar := kbuf as pchar;
+    if StrCmp(kp, "name"c)        == 0 { self.mName    := mfDup(vbuf, vlen); return; }
+    if StrCmp(kp, "version"c)     == 0 { self.mVersion := mfDup(vbuf, vlen); return; }
+    if StrCmp(kp, "author"c)      == 0 { self.mAuthor  := mfDup(vbuf, vlen); return; }
+    if StrCmp(kp, "license"c)     == 0 { self.mLicense := mfDup(vbuf, vlen); return; }
+    if StrCmp(kp, "description"c) == 0 { self.mDesc    := mfDup(vbuf, vlen); return; }
+  }
+
+  // Apply a parsed [build] key=value.
+  fn mfApplyBuild(kbuf: int64, vbuf: int64, vlen: int64): void {
+    if StrCmp(kbuf as pchar, "entry"c) == 0 {
+      self.mEntry := mfDup(vbuf, vlen);
+    }
+  }
+
+  // Parse one key=value line in buf starting at off, for the given section.
+  fn mfLine(buf: int64, off: int64, sec: int64): void {
+    var kbuf: int64 := alloc(MF_STR_MAX);
+    var vbuf: int64 := alloc(MF_STR_MAX);
+    var i: int64 := off;
+    // read key
+    var kconsumed: int64 := 0;
+    if peek8(buf + i) as int64 == 34 {
+      kconsumed := mfQuoted(buf, i, kbuf, MF_STR_MAX);
+    } else {
+      kconsumed := mfToken(buf, i, kbuf, MF_STR_MAX);
+    }
+    i := i + kconsumed;
+    if StrLen(kbuf as pchar) == 0 {
+      free(kbuf, MF_STR_MAX); free(vbuf, MF_STR_MAX); return;
+    }
+    // skip ws + '='
+    i := mfWs(buf, i);
+    if peek8(buf + i) as int64 == 61 { i := i + 1; }
+    i := mfWs(buf, i);
+    // read value
+    var vconsumed: int64 := 0;
+    if peek8(buf + i) as int64 == 34 {
+      vconsumed := mfQuoted(buf, i, vbuf, MF_STR_MAX);
+    } else {
+      vconsumed := mfToken(buf, i, vbuf, MF_STR_MAX);
+    }
+    var vlen: int64 := StrLen(vbuf as pchar);
+    // dispatch
+    if sec == MF_SEC_PKG    { self.mfApplyPkg(kbuf, vbuf, vlen); }
+    if sec == MF_SEC_BUILD  { self.mfApplyBuild(kbuf, vbuf, vlen); }
+    if sec == MF_SEC_DEPS   { self.MfAddDep(kbuf as pchar, vbuf as pchar); }
+    if sec == MF_SEC_DEVDEPS { self.MfAddDevDep(kbuf as pchar, vbuf as pchar); }
+    free(kbuf, MF_STR_MAX);
+    free(vbuf, MF_STR_MAX);
+  }
+
+  // Read and parse lyx.toml at path. Returns true on success.
+  pub fn MfRead(path: pchar): bool {
+    var buf: int64 := alloc(MF_BUF_SZ + 1);
+    var fd: int64 := FileOpen(path, 0, 0);
+    if fd < 0 { free(buf, MF_BUF_SZ + 1); return false; }
+    var nread: int64 := FileRead(fd, buf, MF_BUF_SZ);
+    FileClose(fd);
+    if nread <= 0 { free(buf, MF_BUF_SZ + 1); return false; }
+    poke8(buf + nread, 0);
+
+    var sec: int64 := MF_SEC_NONE;
+    var off: int64 := 0;
+    var sbuf: int64 := alloc(MF_STR_MAX);
+
+    while off < nread {
+      off := mfWs(buf, off);
+      var c: int64 := peek8(buf + off) as int64;
+      if c == 0 || c == 10 || c == 13 || c == 35 {
+        off := mfNL(buf, off);
+        continue;
+      }
+      // section header [name]
+      if c == 91 {
+        off := off + 1;
+        // skip [[package]] array-of-tables: treat as [package]
+        if peek8(buf + off) as int64 == 91 { off := off + 1; }
+        var consumed: int64 := mfToken(buf, off, sbuf, MF_STR_MAX);
+        sec := mfSecOf(sbuf);
+        off := mfNL(buf, off);
+        continue;
+      }
+      // key=value
+      self.mfLine(buf, off, sec);
+      off := mfNL(buf, off);
+    }
+
+    free(sbuf, MF_STR_MAX);
+    free(buf, MF_BUF_SZ + 1);
+    return true;
+  }
+
+  // Write manifest to path as lyx.toml. Returns true on success.
+  pub fn MfWrite(path: pchar): bool {
+    var buf: int64 := alloc(MF_BUF_SZ);
+    var pos: int64 := 0;
+
+    pos := mfWrS(buf, pos, "[package]\n"c);
+    pos := mfWrKV(buf, pos, "name"c,        self.mName);
+    pos := mfWrKV(buf, pos, "version"c,     self.mVersion);
+    pos := mfWrKV(buf, pos, "author"c,      self.mAuthor);
+    pos := mfWrKV(buf, pos, "license"c,     self.mLicense);
+    pos := mfWrKV(buf, pos, "description"c, self.mDesc);
+    pos := mfWrS(buf, pos, "\n"c);
+
+    if self.mDepCount > 0 {
+      pos := mfWrS(buf, pos, "[dependencies]\n"c);
+      var i: int64 := 0;
+      while i < self.mDepCount {
+        var dn: pchar := peek64(self.mDepNames + i * 8) as pchar;
+        var dv: pchar := peek64(self.mDepVers  + i * 8) as pchar;
+        pos := mfWrS(buf, pos, "\""c);
+        pos := mfWrS(buf, pos, dn);
+        pos := mfWrS(buf, pos, "\" = \""c);
+        pos := mfWrS(buf, pos, dv);
+        pos := mfWrS(buf, pos, "\"\n"c);
+        i := i + 1;
+      }
+      pos := mfWrS(buf, pos, "\n"c);
+    }
+
+    if self.mDevCount > 0 {
+      pos := mfWrS(buf, pos, "[dev-dependencies]\n"c);
+      var i: int64 := 0;
+      while i < self.mDevCount {
+        var dn: pchar := peek64(self.mDevNames + i * 8) as pchar;
+        var dv: pchar := peek64(self.mDevVers  + i * 8) as pchar;
+        pos := mfWrS(buf, pos, "\""c);
+        pos := mfWrS(buf, pos, dn);
+        pos := mfWrS(buf, pos, "\" = \""c);
+        pos := mfWrS(buf, pos, dv);
+        pos := mfWrS(buf, pos, "\"\n"c);
+        i := i + 1;
+      }
+      pos := mfWrS(buf, pos, "\n"c);
+    }
+
+    if self.mEntry != 0 as pchar {
+      pos := mfWrS(buf, pos, "[build]\n"c);
+      pos := mfWrKV(buf, pos, "entry"c, self.mEntry);
+    }
+
+    // O_WRONLY=1|O_CREAT=64|O_TRUNC=512=577, mode 0644=420
+    var wfd: int64 := open(path, 577, 420);
+    var ok: bool := false;
+    if wfd >= 0 {
+      sys_write(wfd, buf, pos);
+      close(wfd);
+      ok := true;
+    }
+    free(buf, MF_BUF_SZ);
+    return ok;
+  }
+}

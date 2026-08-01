@@ -1,0 +1,305 @@
+// lpm/core/lockfile.lyx
+// WP-PM-01: lyx.lock Struct — lesen und schreiben.
+// Format: [[package]] name/version/sha256/source (TOML-Subset).
+
+@description("lyx.lock parser and writer")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.lockfile;
+
+import src.std.io;
+import src.std.fs;
+
+// ---------------------------------------------------------------------------
+// Konstanten
+// ---------------------------------------------------------------------------
+
+pub con LF_MAX_PKGS: int64 := 256;
+con LF_BUF_SZ:       int64 := 65536;
+con LF_STR_MAX:      int64 := 512;
+
+// Lock record field offsets within the flat record array (5 × 8 bytes = 40 bytes/record):
+//   +0:  name   (pchar)
+//   +8:  version (pchar)
+//   +16: sha256  (pchar)
+//   +24: source  (pchar)
+con LF_REC_SZ:     int64 := 32;
+con LF_REC_NAME:   int64 := 0;
+con LF_REC_VER:    int64 := 8;
+con LF_REC_SHA256: int64 := 16;
+con LF_REC_SRC:    int64 := 24;
+
+// ---------------------------------------------------------------------------
+// Interne Hilfsfunktionen (identisch zu manifest.lyx — nicht importierbar)
+// ---------------------------------------------------------------------------
+
+fn lfWs(buf: int64, off: int64): int64 {
+  var i: int64 := off;
+  while true {
+    var c: int64 := peek8(buf + i) as int64;
+    if c != 32 && c != 9 { break; }
+    i := i + 1;
+  }
+  return i;
+}
+
+fn lfNL(buf: int64, off: int64): int64 {
+  var i: int64 := off;
+  while true {
+    var c: int64 := peek8(buf + i) as int64;
+    if c == 0 { break; }
+    if c == 10 { i := i + 1; break; }
+    i := i + 1;
+  }
+  return i;
+}
+
+fn lfQuoted(buf: int64, off: int64, dst: int64, cap: int64): int64 {
+  var i: int64 := off + 1;
+  var dlen: int64 := 0;
+  while dlen < cap - 1 {
+    var c: int64 := peek8(buf + i) as int64;
+    if c == 0 || c == 10 || c == 34 { break; }
+    poke8(dst + dlen, c);
+    dlen := dlen + 1;
+    i := i + 1;
+  }
+  poke8(dst + dlen, 0);
+  if peek8(buf + i) as int64 == 34 { i := i + 1; }
+  return i - off;
+}
+
+fn lfToken(buf: int64, off: int64, dst: int64, cap: int64): int64 {
+  var i: int64 := off;
+  var dlen: int64 := 0;
+  while dlen < cap - 1 {
+    var c: int64 := peek8(buf + i) as int64;
+    if c == 0 || c == 10 || c == 13 || c == 32 || c == 9 || c == 35 || c == 61 { break; }
+    poke8(dst + dlen, c);
+    dlen := dlen + 1;
+    i := i + 1;
+  }
+  while dlen > 0 {
+    var last: int64 := peek8(dst + dlen - 1) as int64;
+    if last != 32 && last != 9 && last != 13 { break; }
+    dlen := dlen - 1;
+  }
+  poke8(dst + dlen, 0);
+  return i - off;
+}
+
+fn lfDup(src: int64, slen: int64): pchar {
+  if slen <= 0 { return 0 as pchar; }
+  var dst: int64 := alloc(slen + 1);
+  memcpy(dst, src, slen);
+  poke8(dst + slen, 0);
+  return dst as pchar;
+}
+
+fn lfWrS(buf: int64, pos: int64, s: pchar): int64 {
+  if s == 0 as pchar { return pos; }
+  var slen: int64 := StrLen(s);
+  memcpy(buf + pos, s as int64, slen);
+  return pos + slen;
+}
+
+fn lfWrKV(buf: int64, pos: int64, key: pchar, vlu: pchar): int64 {
+  pos := lfWrS(buf, pos, key);
+  pos := lfWrS(buf, pos, " = \""c);
+  pos := lfWrS(buf, pos, vlu);
+  pos := lfWrS(buf, pos, "\"\n"c);
+  return pos;
+}
+
+// ---------------------------------------------------------------------------
+// LockFile
+// ---------------------------------------------------------------------------
+
+pub type LockFile = class {
+  // Flat record buffer: LF_MAX_PKGS * LF_REC_SZ bytes.
+  lfRecs:  int64;
+  lfCount: int64;
+
+  pub fn LfInit(): void {
+    self.lfRecs  := alloc(LF_MAX_PKGS * LF_REC_SZ);
+    self.lfCount := 0;
+  }
+
+  fn lfFreeS(s: pchar): void {
+    if s != 0 as pchar { free(s as int64, StrLen(s) + 1); }
+  }
+
+  pub fn LfFree(): void {
+    var i: int64 := 0;
+    while i < self.lfCount {
+      var rec: int64 := self.lfRecs + i * LF_REC_SZ;
+      self.lfFreeS(peek64(rec + LF_REC_NAME)   as pchar);
+      self.lfFreeS(peek64(rec + LF_REC_VER)    as pchar);
+      self.lfFreeS(peek64(rec + LF_REC_SHA256) as pchar);
+      self.lfFreeS(peek64(rec + LF_REC_SRC)    as pchar);
+      i := i + 1;
+    }
+    free(self.lfRecs, LF_MAX_PKGS * LF_REC_SZ);
+  }
+
+  pub fn LfAddPkg(name: pchar, ver: pchar, sha256: pchar, src: pchar): void {
+    if self.lfCount >= LF_MAX_PKGS { return; }
+    var rec: int64 := self.lfRecs + self.lfCount * LF_REC_SZ;
+    poke64(rec + LF_REC_NAME,   lfDup(name   as int64, StrLen(name))   as int64);
+    poke64(rec + LF_REC_VER,    lfDup(ver    as int64, StrLen(ver))    as int64);
+    poke64(rec + LF_REC_SHA256, lfDup(sha256 as int64, StrLen(sha256)) as int64);
+    poke64(rec + LF_REC_SRC,    lfDup(src    as int64, StrLen(src))    as int64);
+    self.lfCount := self.lfCount + 1;
+  }
+
+  // Returns the record index for name, or -1 if not found.
+  pub fn LfFind(name: pchar): int64 {
+    var i: int64 := 0;
+    while i < self.lfCount {
+      var rec: int64 := self.lfRecs + i * LF_REC_SZ;
+      var rname: pchar := peek64(rec + LF_REC_NAME) as pchar;
+      // Achtung: && schliesst in lyxc nicht kurz — Null-Check muss geschachtelt sein.
+      if rname != 0 as pchar {
+        if StrCmp(rname, name) == 0 { return i; }
+      }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  pub fn LfGetName(idx: int64): pchar {
+    if idx < 0 || idx >= self.lfCount { return 0 as pchar; }
+    return peek64(self.lfRecs + idx * LF_REC_SZ + LF_REC_NAME) as pchar;
+  }
+
+  pub fn LfGetVer(idx: int64): pchar {
+    if idx < 0 || idx >= self.lfCount { return 0 as pchar; }
+    return peek64(self.lfRecs + idx * LF_REC_SZ + LF_REC_VER) as pchar;
+  }
+
+  pub fn LfGetSha256(idx: int64): pchar {
+    if idx < 0 || idx >= self.lfCount { return 0 as pchar; }
+    return peek64(self.lfRecs + idx * LF_REC_SZ + LF_REC_SHA256) as pchar;
+  }
+
+  pub fn LfGetSrc(idx: int64): pchar {
+    if idx < 0 || idx >= self.lfCount { return 0 as pchar; }
+    return peek64(self.lfRecs + idx * LF_REC_SZ + LF_REC_SRC) as pchar;
+  }
+
+  // Read lyx.lock at path. Returns true on success.
+  pub fn LfRead(path: pchar): bool {
+    var buf: int64 := alloc(LF_BUF_SZ + 1);
+    var fd: int64 := FileOpen(path, 0, 0);
+    if fd < 0 { free(buf, LF_BUF_SZ + 1); return false; }
+    var nread: int64 := FileRead(fd, buf, LF_BUF_SZ);
+    FileClose(fd);
+    if nread <= 0 { free(buf, LF_BUF_SZ + 1); return false; }
+    poke8(buf + nread, 0);
+
+    var off: int64 := 0;
+    var kbuf: int64 := alloc(LF_STR_MAX);
+    var vbuf: int64 := alloc(LF_STR_MAX);
+    // Temporary record being built (cleared on [[package]])
+    var curName:   int64 := alloc(LF_STR_MAX);
+    var curVer:    int64 := alloc(LF_STR_MAX);
+    var curSha:    int64 := alloc(LF_STR_MAX);
+    var curSrc:    int64 := alloc(LF_STR_MAX);
+    poke8(curName, 0); poke8(curVer, 0); poke8(curSha, 0); poke8(curSrc, 0);
+    var inPkg: bool := false;
+
+    while off < nread {
+      off := lfWs(buf, off);
+      var c: int64 := peek8(buf + off) as int64;
+      if c == 0 || c == 10 || c == 13 || c == 35 {
+        off := lfNL(buf, off);
+        continue;
+      }
+      // [[package]]
+      if c == 91 && peek8(buf + off + 1) as int64 == 91 {
+        // flush previous record
+        if inPkg && StrLen(curName as pchar) > 0 {
+          self.LfAddPkg(curName as pchar, curVer as pchar,
+                        curSha as pchar, curSrc as pchar);
+        }
+        poke8(curName, 0); poke8(curVer, 0); poke8(curSha, 0); poke8(curSrc, 0);
+        inPkg := true;
+        off := lfNL(buf, off);
+        continue;
+      }
+      // [other-section] — reset
+      if c == 91 {
+        if inPkg && StrLen(curName as pchar) > 0 {
+          self.LfAddPkg(curName as pchar, curVer as pchar,
+                        curSha as pchar, curSrc as pchar);
+          poke8(curName, 0); poke8(curVer, 0); poke8(curSha, 0); poke8(curSrc, 0);
+          inPkg := false;
+        }
+        off := lfNL(buf, off);
+        continue;
+      }
+      // key = value
+      if inPkg {
+        var kc: int64 := 0;
+        if peek8(buf + off) as int64 == 34 {
+          kc := lfQuoted(buf, off, kbuf, LF_STR_MAX);
+        } else {
+          kc := lfToken(buf, off, kbuf, LF_STR_MAX);
+        }
+        var i: int64 := off + kc;
+        i := lfWs(buf, i);
+        if peek8(buf + i) as int64 == 61 { i := i + 1; }
+        i := lfWs(buf, i);
+        var vc: int64 := 0;
+        if peek8(buf + i) as int64 == 34 {
+          vc := lfQuoted(buf, i, vbuf, LF_STR_MAX);
+        } else {
+          vc := lfToken(buf, i, vbuf, LF_STR_MAX);
+        }
+        var kp: pchar := kbuf as pchar;
+        if StrCmp(kp, "name"c)   == 0 { memcpy(curName, vbuf, StrLen(vbuf as pchar) + 1); }
+        if StrCmp(kp, "version"c) == 0 { memcpy(curVer,  vbuf, StrLen(vbuf as pchar) + 1); }
+        if StrCmp(kp, "sha256"c) == 0 { memcpy(curSha,  vbuf, StrLen(vbuf as pchar) + 1); }
+        if StrCmp(kp, "source"c) == 0 { memcpy(curSrc,  vbuf, StrLen(vbuf as pchar) + 1); }
+      }
+      off := lfNL(buf, off);
+    }
+    // flush last record
+    if inPkg && StrLen(curName as pchar) > 0 {
+      self.LfAddPkg(curName as pchar, curVer as pchar,
+                    curSha as pchar, curSrc as pchar);
+    }
+    free(kbuf, LF_STR_MAX); free(vbuf, LF_STR_MAX);
+    free(curName, LF_STR_MAX); free(curVer, LF_STR_MAX);
+    free(curSha, LF_STR_MAX);  free(curSrc, LF_STR_MAX);
+    free(buf, LF_BUF_SZ + 1);
+    return true;
+  }
+
+  // Write lyx.lock to path. Returns true on success.
+  pub fn LfWrite(path: pchar): bool {
+    var buf: int64 := alloc(LF_BUF_SZ);
+    var pos: int64 := 0;
+
+    pos := lfWrS(buf, pos, "# Automatisch generiert — nicht manuell bearbeiten\n"c);
+    var i: int64 := 0;
+    while i < self.lfCount {
+      pos := lfWrS(buf, pos, "\n[[package]]\n"c);
+      pos := lfWrKV(buf, pos, "name"c,    self.LfGetName(i));
+      pos := lfWrKV(buf, pos, "version"c, self.LfGetVer(i));
+      pos := lfWrKV(buf, pos, "sha256"c,  self.LfGetSha256(i));
+      pos := lfWrKV(buf, pos, "source"c,  self.LfGetSrc(i));
+      i := i + 1;
+    }
+
+    var wfd: int64 := open(path, 577, 420);
+    var ok: bool := false;
+    if wfd >= 0 {
+      sys_write(wfd, buf, pos);
+      close(wfd);
+      ok := true;
+    }
+    free(buf, LF_BUF_SZ);
+    return ok;
+  }
+}
