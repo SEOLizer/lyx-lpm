@@ -158,7 +158,10 @@ pub type LockFile = class {
     while i < self.lfCount {
       var rec: int64 := self.lfRecs + i * LF_REC_SZ;
       var rname: pchar := peek64(rec + LF_REC_NAME) as pchar;
-      if rname != 0 as pchar && StrCmp(rname, name) == 0 { return i; }
+      // Achtung: && schliesst in lyxc nicht kurz — Null-Check muss geschachtelt sein.
+      if rname != 0 as pchar {
+        if StrCmp(rname, name) == 0 { return i; }
+      }
       i := i + 1;
     }
     return 0 - 1;

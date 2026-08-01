@@ -1,6 +1,6 @@
 // lpm/cli/commands.lyx
 // WP-PM-02: Subcommand-Dispatch und Implementierungen.
-// Voll implementiert: help, version, init, cache list.
+// Voll implementiert: help, version, init, cache list, cache clean.
 // Stubs (noch kein Netzwerk): install, remove, update, search, info,
 //                              list, publish, login, resolve.
 
@@ -14,6 +14,8 @@ import src.std.fs;
 import lpm.cli.args;
 import lpm.core.manifest;
 import lpm.core.lockfile;
+import lpm.core.dirent;
+import lpm.core.cache;
 
 // ---------------------------------------------------------------------------
 // Schreib-Hilfsfunktionen (via sys_write — kein io-Import nötig)
@@ -158,9 +160,17 @@ fn lpmInit(ctx: LpmCtx): int64 {
 // ---------------------------------------------------------------------------
 
 fn lpmCacheList(argc: int64, argv: pchar): int64 {
-  // PM-03: DirEntryName/DirFree benötigen std.fs (inkompatibel mit src.std.*)
-  cmdOutLn("lpm cache list: noch nicht implementiert (PM-03)."c);
-  return 1;
+  var home: pchar := cmdGetHome(argc, argv);
+  return LpmCacheListCmd(home);
+}
+
+// ---------------------------------------------------------------------------
+// lpm cache clean
+// ---------------------------------------------------------------------------
+
+fn lpmCacheClean(argc: int64, argv: pchar): int64 {
+  var home: pchar := cmdGetHome(argc, argv);
+  return LpmCacheCleanCmd(home);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,9 +207,12 @@ pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   if StrCmp(cmd, "resolve"c) == 0 { return lpmNotImpl("resolve"c); }
 
   if StrCmp(cmd, "cache"c) == 0 {
+    // Achtung: && schliesst hier nicht kurz — Null-Check muss geschachtelt sein.
     var sub: pchar := ctx.LcSubArg(0);
-    if sub != 0 as pchar && StrCmp(sub, "list"c)  == 0 { return lpmCacheList(argc, argv); }
-    if sub != 0 as pchar && StrCmp(sub, "clean"c) == 0 { return lpmNotImpl("cache clean"c); }
+    if sub != 0 as pchar {
+      if StrCmp(sub, "list"c)  == 0 { return lpmCacheList(argc, argv); }
+      if StrCmp(sub, "clean"c) == 0 { return lpmCacheClean(argc, argv); }
+    }
     cmdOutLn("lpm cache: Subcommand erwartet: list | clean"c);
     return 1;
   }

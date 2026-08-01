@@ -1,0 +1,184 @@
+// lpm/core/dirent.lyx
+// WP-PM-03: Verzeichnis-Listing mit Index-Zugriff.
+//
+// Hintergrund: src.std.fs.DirList liefert eine Hashmap ohne Index-Zugriff und
+// ohne DirEntryName/DirFree. Die Variante aus std.fs hat diese API zwar, ist
+// aber wegen 19 kollidierender pub-Symbole (DirList, FileExists, Mkdir, ...)
+// nicht zusammen mit src.std.fs importierbar. Deshalb ruft dieses Modul
+// getdents64 direkt auf und baut einen eigenen, flachen Puffer.
+//
+// Puffer-Layout:
+//   +0   count      (int64)  Anzahl Eintraege
+//   +8   capacity   (int64)  Gesamtgroesse der Allokation (fuer free)
+//   +16  idxTabOff  (int64)  Offset der Index-Tabelle relativ zum Puffer-Start
+//   +24  Eintraege: [ nameLen(int64) | dType(int8) | name | NUL ]*
+//   idxTabOff: count * int64, Offsets der Eintraege, nach Namen sortiert
+
+@description("lpm directory listing with indexed access")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.dirent;
+
+import src.std.io;
+
+// ---------------------------------------------------------------------------
+// Konstanten (eigenes Praefix — src.std.fs definiert O_* / DT_* ebenfalls)
+// ---------------------------------------------------------------------------
+
+con LPD_O_RDONLY:    int64 := 0;
+con LPD_O_DIRECTORY: int64 := 65536;
+
+con LPD_RAW_BUF:  int64 := 32768;   // getdents64-Rohpuffer
+con LPD_BUF_CAP:  int64 := 262144;  // Ergebnispuffer inkl. Index-Tabelle
+con LPD_MAX_ENTS: int64 := 2048;    // Obergrenze Eintraege (Index-Tabelle)
+
+con LPD_HDR: int64 := 24;           // count + capacity + idxTabOff
+
+pub con LPD_DT_UNKNOWN: int64 := 0;
+pub con LPD_DT_DIR:     int64 := 4;
+pub con LPD_DT_REG:     int64 := 8;
+pub con LPD_DT_LNK:     int64 := 10;
+
+// ---------------------------------------------------------------------------
+// Interne Helfer
+// ---------------------------------------------------------------------------
+
+// Byteweiser Vergleich zweier nullterminierter Strings.
+// Rueckgabe: <0, 0 oder >0 (wie strcmp).
+fn lpdStrCmp(a: pchar, b: pchar): int64 {
+  var i: int64 := 0;
+  while true {
+    var ca: int64 := peek8(a as int64 + i) as int64;
+    var cb: int64 := peek8(b as int64 + i) as int64;
+    if ca != cb { return ca - cb; }
+    if ca == 0 { return 0; }
+    i := i + 1;
+  }
+  return 0;
+}
+
+// Name-Zeiger fuer einen Eintrags-Offset (Offset zeigt auf nameLen).
+fn lpdNameAt(dl: int64, off: int64): pchar {
+  return (dl + off + 9) as pchar;  // nameLen(8) + dType(1)
+}
+
+// ---------------------------------------------------------------------------
+// Oeffentliche API
+// ---------------------------------------------------------------------------
+
+// Liest ein Verzeichnis vollstaendig ein. "." und ".." werden uebersprungen,
+// die Eintraege sind nach Namen sortiert.
+// Rueckgabe: Puffer-Handle, oder 0 wenn das Verzeichnis nicht lesbar ist.
+// Der Aufrufer muss LpmDirClose aufrufen.
+pub fn LpmDirOpen(path: pchar): int64 {
+  var dirfd: int64 := open(path, LPD_O_RDONLY | LPD_O_DIRECTORY, 0);
+  if dirfd < 0 { return 0; }
+
+  var rawBuf: int64 := alloc(LPD_RAW_BUF);
+  var resBuf: int64 := alloc(LPD_BUF_CAP);
+  var idxTabOff: int64 := LPD_BUF_CAP - LPD_MAX_ENTS * 8;
+  var resPos: int64 := LPD_HDR;
+  var count:  int64 := 0;
+
+  while true {
+    var nRead: int64 := getdents64(dirfd, rawBuf, LPD_RAW_BUF);
+    if nRead <= 0 { break; }
+
+    var pos: int64 := 0;
+    while pos < nRead {
+      var entryLen: int64 := peek16(rawBuf + pos + 16) as int64;
+      if entryLen <= 0 { break; }
+
+      var namePtr:   int64 := rawBuf + pos + 19;
+      var firstChar: int64 := peek8(namePtr) as int64;
+
+      // "." und ".." ueberspringen
+      if firstChar != 46 {
+        if count < LPD_MAX_ENTS {
+          var dType:   int64 := peek8(rawBuf + pos + 18) as int64;
+          var nameLen: int64 := 0;
+          while peek8(namePtr + nameLen) as int64 != 0 { nameLen := nameLen + 1; }
+
+          // Ueberlaufschutz: Eintraege duerfen die Index-Tabelle nicht erreichen
+          if resPos + 8 + 1 + nameLen + 1 < idxTabOff {
+            poke64(resBuf + idxTabOff + count * 8, resPos);
+            poke64(resBuf + resPos, nameLen);
+            resPos := resPos + 8;
+            poke8(resBuf + resPos, dType);
+            resPos := resPos + 1;
+            var i: int64 := 0;
+            while i < nameLen {
+              poke8(resBuf + resPos + i, peek8(namePtr + i) as int64);
+              i := i + 1;
+            }
+            poke8(resBuf + resPos + nameLen, 0);
+            resPos := resPos + nameLen + 1;
+            count := count + 1;
+          }
+        }
+      }
+
+      pos := pos + entryLen;
+    }
+  }
+
+  close(dirfd);
+  free(rawBuf, LPD_RAW_BUF);
+
+  poke64(resBuf,      count);
+  poke64(resBuf + 8,  LPD_BUF_CAP);
+  poke64(resBuf + 16, idxTabOff);
+
+  // Insertion-Sort der Offset-Tabelle nach Eintragsnamen (deterministisch)
+  var i2: int64 := 1;
+  while i2 < count {
+    var cur: int64 := peek64(resBuf + idxTabOff + i2 * 8);
+    var j: int64 := i2 - 1;
+    while j >= 0 {
+      var prev: int64 := peek64(resBuf + idxTabOff + j * 8);
+      if lpdStrCmp(lpdNameAt(resBuf, prev), lpdNameAt(resBuf, cur)) <= 0 { break; }
+      poke64(resBuf + idxTabOff + (j + 1) * 8, prev);
+      j := j - 1;
+    }
+    poke64(resBuf + idxTabOff + (j + 1) * 8, cur);
+    i2 := i2 + 1;
+  }
+
+  return resBuf;
+}
+
+// Anzahl der Eintraege.
+pub fn LpmDirCount(dl: int64): int64 {
+  if dl == 0 { return 0; }
+  return peek64(dl);
+}
+
+// Name des idx-ten Eintrags (0-basiert), oder null wenn ausserhalb des Bereichs.
+// Der Zeiger bleibt bis LpmDirClose gueltig.
+pub fn LpmDirName(dl: int64, idx: int64): pchar {
+  if dl == 0 { return 0 as pchar; }
+  if idx < 0 || idx >= peek64(dl) { return 0 as pchar; }
+  var off: int64 := peek64(dl + peek64(dl + 16) + idx * 8);
+  return lpdNameAt(dl, off);
+}
+
+// Laenge des Namens des idx-ten Eintrags, oder 0.
+pub fn LpmDirNameLen(dl: int64, idx: int64): int64 {
+  if dl == 0 { return 0; }
+  if idx < 0 || idx >= peek64(dl) { return 0; }
+  var off: int64 := peek64(dl + peek64(dl + 16) + idx * 8);
+  return peek64(dl + off);
+}
+
+// DT_*-Typ des idx-ten Eintrags, oder LPD_DT_UNKNOWN.
+pub fn LpmDirType(dl: int64, idx: int64): int64 {
+  if dl == 0 { return LPD_DT_UNKNOWN; }
+  if idx < 0 || idx >= peek64(dl) { return LPD_DT_UNKNOWN; }
+  var off: int64 := peek64(dl + peek64(dl + 16) + idx * 8);
+  return peek8(dl + off + 8) as int64;
+}
+
+// Gibt den Puffer frei.
+pub fn LpmDirClose(dl: int64): void {
+  if dl != 0 { free(dl, peek64(dl + 8)); }
+}
